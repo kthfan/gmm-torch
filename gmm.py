@@ -1,9 +1,26 @@
+#### copied from https://github.com/ldeecke/gmm-torch
+
+
 import torch
 import numpy as np
 
 from math import pi
-from scipy.special import logsumexp
-from utils import calculate_matmul, calculate_matmul_n_times
+from collections import deque
+
+# compatible with torch 1.8
+if hasattr(torch.linalg, 'cholesky_ex'):
+    cholesky = lambda *args, **kwargs: torch.linalg.cholesky_ex(*args, **kwargs)[0]
+elif hasattr(torch.linalg, 'cholesky'):
+    cholesky = torch.linalg.cholesky
+else:
+    cholesky = torch.cholesky
+
+if hasattr(torch.linalg, 'inv_ex'):
+    inverse = lambda *args, **kwargs: torch.linalg.inv_ex(*args, **kwargs)[0]
+elif hasattr(torch.linalg, 'inv'):
+    inverse = torch.linalg.inv
+else:
+    inverse = torch.inverse
 
 
 class GaussianMixture(torch.nn.Module):
@@ -15,7 +32,9 @@ class GaussianMixture(torch.nn.Module):
     probabilities are shaped (n, k, 1) if they relate to an individual sample,
     or (1, k, 1) if they assign membership probabilities to one of the mixture components.
     """
-    def __init__(self, n_components, n_features, covariance_type="full", eps=1.e-6, init_params="kmeans", mu_init=None, var_init=None):
+
+    def __init__(self, n_components, n_features, covariance_type="full", eps=1.e-6, init_params="kmeans", mu_init=None,
+                 var_init=None):
         """
         Initializes the model and brings all tensors into their required shape.
         The class expects data to be fed as a flat tensor in (n, d).
@@ -57,39 +76,50 @@ class GaussianMixture(torch.nn.Module):
         assert self.covariance_type in ["full", "diag"]
         assert self.init_params in ["kmeans", "random"]
 
-        self._init_params()
 
+        self.pi = torch.nn.Parameter(torch.ones(1, self.n_components, 1) / self.n_components, requires_grad=False)
+        self.mu = torch.nn.Parameter(torch.ones(1, self.n_components, self.n_features), requires_grad=False)
+        if self.covariance_type == "diag":
+            self.var = torch.nn.Parameter(torch.ones(1, self.n_components, self.n_features), requires_grad=False)
+        elif self.covariance_type == "full":
+            self.var = torch.nn.Parameter(
+                    torch.eye(self.n_features)[None, None].repeat(1, self.n_components, 1, 1),
+                    requires_grad=False)
+
+        self._init_params()
 
     def _init_params(self):
         if self.mu_init is not None:
-            assert self.mu_init.size() == (1, self.n_components, self.n_features), "Input mu_init does not have required tensor dimensions (1, %i, %i)" % (self.n_components, self.n_features)
+            assert self.mu_init.size() == (1, self.n_components,
+                                           self.n_features), "Input mu_init does not have required tensor dimensions (1, %i, %i)" % (
+            self.n_components, self.n_features)
             # (1, k, d)
-            self.mu = torch.nn.Parameter(self.mu_init, requires_grad=False)
+            self.mu.copy_(self.mu_init)
         else:
-            self.mu = torch.nn.Parameter(torch.randn(1, self.n_components, self.n_features), requires_grad=False)
+            self.mu.copy_(torch.randn(1, self.n_components, self.n_features))
 
         if self.covariance_type == "diag":
             if self.var_init is not None:
                 # (1, k, d)
-                assert self.var_init.size() == (1, self.n_components, self.n_features), "Input var_init does not have required tensor dimensions (1, %i, %i)" % (self.n_components, self.n_features)
-                self.var = torch.nn.Parameter(self.var_init, requires_grad=False)
+                assert self.var_init.size() == (1, self.n_components,
+                                                self.n_features), "Input var_init does not have required tensor dimensions (1, %i, %i)" % (
+                self.n_components, self.n_features)
+                self.var.copy_(self.var_init)
             else:
-                self.var = torch.nn.Parameter(torch.ones(1, self.n_components, self.n_features), requires_grad=False)
+                self.var.copy_(torch.ones(1, self.n_components, self.n_features))
         elif self.covariance_type == "full":
             if self.var_init is not None:
                 # (1, k, d, d)
-                assert self.var_init.size() == (1, self.n_components, self.n_features, self.n_features), "Input var_init does not have required tensor dimensions (1, %i, %i, %i)" % (self.n_components, self.n_features, self.n_features)
-                self.var = torch.nn.Parameter(self.var_init, requires_grad=False)
+                assert self.var_init.size() == (1, self.n_components, self.n_features,
+                                                self.n_features), "Input var_init does not have required tensor dimensions (1, %i, %i, %i)" % (
+                self.n_components, self.n_features, self.n_features)
+                self.var.copy_(self.var_init)
             else:
-                self.var = torch.nn.Parameter(
-                    torch.eye(self.n_features).reshape(1, 1, self.n_features, self.n_features).repeat(1, self.n_components, 1, 1),
-                    requires_grad=False
-                )
+                self.var.copy_(torch.eye(self.n_features)[None, None].repeat(1, self.n_components,1, 1))
 
         # (1, k, 1)
-        self.pi = torch.nn.Parameter(torch.Tensor(1, self.n_components, 1), requires_grad=False).fill_(1. / self.n_components)
+        self.pi.copy_(torch.ones(1, self.n_components, 1) / self.n_components)
         self.params_fitted = False
-
 
     def check_size(self, x):
         if len(x.size()) == 2:
@@ -97,7 +127,6 @@ class GaussianMixture(torch.nn.Module):
             x = x.unsqueeze(1)
 
         return x
-
 
     def bic(self, x):
         """
@@ -116,7 +145,6 @@ class GaussianMixture(torch.nn.Module):
         bic = -2. * self.__score(x, as_average=False).mean() * n + free_params * np.log(n)
 
         return bic
-
 
     def fit(self, x, delta=1e-3, n_iter=100, warm_start=False):
         """
@@ -138,41 +166,35 @@ class GaussianMixture(torch.nn.Module):
             self.mu.data = mu
 
         i = 0
-        j = np.inf
 
-        while (i <= n_iter) and (j >= delta):
+        while (i <= n_iter):
+            if i == 0:
+                log_likelihood_old, log_resp = self._e_step(x, self.pi, self.mu, self.var)
+                pi_new, mu_new, var_new = self._m_step(x, log_resp)
+            elif i == n_iter:
+                log_likelihood_new, log_resp = self._e_step(x, pi_new, mu_new, var_new)
 
-            log_likelihood_old = self.log_likelihood
-            mu_old = self.mu
-            var_old = self.var
+                # update self.pi, self.mu, self.var
+                if not self._update_if_valid(x, delta,
+                                log_likelihood_old, log_likelihood_new,
+                                pi_new, mu_new, var_new):
+                    break
+            else:
+                log_likelihood_new, log_resp = self._e_step(x, pi_new, mu_new, var_new)
 
-            self.__em(x)
-            self.log_likelihood = self.__score(x)
+                # update self.pi, self.mu, self.var
+                if not self._update_if_valid(x, delta,
+                                log_likelihood_old, log_likelihood_new,
+                                pi_new, mu_new, var_new):
+                    break
 
-            if torch.isinf(self.log_likelihood.abs()) or torch.isnan(self.log_likelihood):
-                device = self.mu.device
-                # When the log-likelihood assumes unbound values, reinitialize model
-                self.__init__(self.n_components,
-                    self.n_features,
-                    covariance_type=self.covariance_type,
-                    mu_init=self.mu_init,
-                    var_init=self.var_init,
-                    eps=self.eps)
-                for p in self.parameters():
-                    p.data = p.data.to(device)
-                if self.init_params == "kmeans":
-                    self.mu.data, = self.get_kmeans_mu(x, n_centers=self.n_components)
+                log_likelihood_old = log_likelihood_new
+                pi_new, mu_new, var_new = self._m_step(x, log_resp)
 
             i += 1
-            j = self.log_likelihood - log_likelihood_old
 
-            if j <= delta:
-                # When score decreases, revert to old parameters
-                self.__update_mu(mu_old)
-                self.__update_var(var_old)
 
         self.params_fitted = True
-
 
     def predict(self, x, probs=False):
         """
@@ -196,7 +218,6 @@ class GaussianMixture(torch.nn.Module):
         else:
             return torch.squeeze(torch.max(weighted_log_prob, 1)[1].type(torch.LongTensor))
 
-
     def predict_proba(self, x):
         """
         Returns normalized probabilities of class membership.
@@ -206,7 +227,6 @@ class GaussianMixture(torch.nn.Module):
             y:          torch.LongTensor (n)
         """
         return self.predict(x, probs=True)
-
 
     def sample(self, n):
         """
@@ -222,9 +242,10 @@ class GaussianMixture(torch.nn.Module):
         y = torch.cat([torch.full([int(sample)], j, device=counts.device) for j, sample in enumerate(counts)])
 
         # Only iterate over components with non-zero counts
-        for k in np.arange(self.n_components)[counts > 0]: 
+        for k in np.arange(self.n_components)[counts > 0]:
             if self.covariance_type == "diag":
-                x_k = self.mu[0, k] + torch.randn(int(counts[k]), self.n_features, device=x.device) * torch.sqrt(self.var[0, k])
+                x_k = self.mu[0, k] + torch.randn(int(counts[k]), self.n_features, device=x.device) * torch.sqrt(
+                    self.var[0, k])
             elif self.covariance_type == "full":
                 d_k = torch.distributions.multivariate_normal.MultivariateNormal(self.mu[0, k], self.var[0, k])
                 x_k = torch.stack([d_k.sample() for _ in range(int(counts[k]))])
@@ -232,7 +253,6 @@ class GaussianMixture(torch.nn.Module):
             x = torch.cat((x, x_k), dim=0)
 
         return x, y
-
 
     def score_samples(self, x):
         """
@@ -247,6 +267,47 @@ class GaussianMixture(torch.nn.Module):
         score = self.__score(x, as_average=False)
         return score
 
+    def _update_if_valid(self, x, delta,
+               log_likelihood_old, log_likelihood_new,
+               pi_new, mu_new, var_new):
+        """
+        Update according to log-likelihood improvement.
+        args:
+            x:          torch.Tensor (n, d) or (n, 1, d)
+            delta:        float
+            log_likelihood_old  torch.Tensor (1,)
+            log_likelihood_new  torch.Tensor (1,)
+            pi_new
+            mu_new
+            var_new
+        returns:
+            updated:      bool, whether parameters are updated.
+        """
+        if torch.isinf(log_likelihood_new.abs()) or torch.isnan(log_likelihood_new):
+            device = self.mu.device
+            # When the log-likelihood assumes unbound values, reinitialize model
+            self.__init__(self.n_components,
+                            self.n_features,
+                            covariance_type=self.covariance_type,
+                            mu_init=self.mu_init,
+                            var_init=self.var_init,
+                            eps=self.eps)
+            for p in self.parameters():
+                p.data = p.data.to(device)
+            if self.init_params == "kmeans":
+                self.mu.data, = self.get_kmeans_mu(x, n_centers=self.n_components)
+
+        j = log_likelihood_new - log_likelihood_old
+
+        self.__update_pi(pi_new)
+        if j > delta:
+            # When score increase, update the new parameters
+            self.log_likelihood = log_likelihood_new
+            self.__update_mu(mu_new)
+            self.__update_var(var_new)
+            return True
+        else:
+            return False
 
     def _estimate_log_prob(self, x):
         """
@@ -262,30 +323,27 @@ class GaussianMixture(torch.nn.Module):
             mu = self.mu
             var = self.var
 
-            precision = torch.inverse(var)
+            precision = inverse(var)
             d = x.shape[-1]
 
             log_2pi = d * np.log(2. * pi)
 
             log_det = self._calculate_log_det(precision)
 
-            x_mu_T = (x - mu).unsqueeze(-2)
-            x_mu = (x - mu).unsqueeze(-1)
-
-            x_mu_T_precision = calculate_matmul_n_times(self.n_components, x_mu_T, precision)
-            x_mu_T_precision_x_mu = calculate_matmul(x_mu_T_precision, x_mu)
+            xc = x - mu
+            x_mu_T_precision_x_mu = (xc[:, :, None, :] @ precision @ xc[:, :, :, None]).squeeze(-1)
 
             return -.5 * (log_2pi - log_det + x_mu_T_precision_x_mu)
 
         elif self.covariance_type == "diag":
             mu = self.mu
             prec = torch.rsqrt(self.var)
+            prec2 = prec ** 2 # original https://github.com/ldeecke/gmm-torch not consistent with scikit-learn, corrected.
 
-            log_p = torch.sum((mu * mu + x * x - 2 * x * mu) * prec, dim=2, keepdim=True)
+            log_p = torch.sum((mu * mu + x * x - 2 * x * mu) * prec2, dim=2, keepdim=True)
             log_det = torch.sum(torch.log(prec), dim=2, keepdim=True)
 
             return -.5 * (self.n_features * np.log(2. * pi) + log_p - log_det)
-
 
     def _calculate_log_det(self, var):
         """
@@ -293,34 +351,41 @@ class GaussianMixture(torch.nn.Module):
         args:
             var:            torch.Tensor (1, k, d, d)
         """
-        log_det = torch.empty(size=(self.n_components,)).to(var.device)
-        
-        for k in range(self.n_components):
-            log_det[k] = 2 * torch.log(torch.diagonal(torch.linalg.cholesky(var[0,k]))).sum()
+        # var = var + var.transpose(-1, -2) - torch.diag(var.diagonal())
+        d = torch.diagonal(cholesky(var), dim1=2, dim2=3)
+        d.clip_(self.eps)
+        log_det = 2 * torch.log(d).sum(dim=2)
 
         return log_det.unsqueeze(-1)
 
-
-    def _e_step(self, x):
+    def _e_step(self, x, pi, mu, var):
         """
         Computes log-responses that indicate the (logarithmic) posterior belief (sometimes called responsibilities) that a data point was generated by one of the k mixture components.
         Also returns the mean of the mean of the logarithms of the probabilities (as is done in sklearn).
         This is the so-called expectation step of the EM-algorithm.
         args:
             x:              torch.Tensor (n, d) or (n, 1, d)
+            pi:              Parameter pi.
+            mu:              Parameter mu.
+            var:             Parameter variance.
         returns:
             log_prob_norm:  torch.Tensor (1)
             log_resp:       torch.Tensor (n, k, 1)
         """
         x = self.check_size(x)
 
+        # hijack parameters
+        pi_, mu_, var_ = self.pi, self.mu, self.var
+        self.pi.data, self.mu.data, self.var.data = pi, mu, var
+
         weighted_log_prob = self._estimate_log_prob(x) + torch.log(self.pi)
+
+        # restore parameters
+        self.pi.data, self.mu.data, self.var.data = pi_, mu_, var_
 
         log_prob_norm = torch.logsumexp(weighted_log_prob, dim=1, keepdim=True)
         log_resp = weighted_log_prob - log_prob_norm
-
         return torch.mean(log_prob_norm), log_resp
-
 
     def _m_step(self, x, log_resp):
         """
@@ -343,7 +408,8 @@ class GaussianMixture(torch.nn.Module):
         if self.covariance_type == "full":
             eps = (torch.eye(self.n_features) * self.eps).to(x.device)
             var = torch.sum((x - mu).unsqueeze(-1).matmul((x - mu).unsqueeze(-2)) * resp.unsqueeze(-1), dim=0,
-                            keepdim=True) / torch.sum(resp, dim=0, keepdim=True).unsqueeze(-1) + eps
+                            keepdim=True) / (torch.sum(resp, dim=0, keepdim=True).unsqueeze(-1) + self.eps) + eps
+            # oririnal implementation didn't add eps on var might cause "cholesky_: U(...,...) is zero, singular U" error.
 
         elif self.covariance_type == "diag":
             x2 = (resp * x * x).sum(0, keepdim=True) / pi
@@ -352,9 +418,7 @@ class GaussianMixture(torch.nn.Module):
             var = x2 - 2 * xmu + mu2 + self.eps
 
         pi = pi / x.shape[0]
-
         return pi, mu, var
-
 
     def __em(self, x):
         """
@@ -362,13 +426,11 @@ class GaussianMixture(torch.nn.Module):
         args:
             x:          torch.Tensor (n, 1, d)
         """
-        _, log_resp = self._e_step(x)
+        ll, log_resp = self._e_step(x)
         pi, mu, var = self._m_step(x, log_resp)
-
         self.__update_pi(pi)
         self.__update_mu(mu)
         self.__update_var(var)
-
 
     def __score(self, x, as_average=True):
         """
@@ -390,20 +452,20 @@ class GaussianMixture(torch.nn.Module):
         else:
             return torch.squeeze(per_sample_score)
 
-
     def __update_mu(self, mu):
         """
         Updates mean to the provided value.
         args:
             mu:         torch.FloatTensor
         """
-        assert mu.size() in [(self.n_components, self.n_features), (1, self.n_components, self.n_features)], "Input mu does not have required tensor dimensions (%i, %i) or (1, %i, %i)" % (self.n_components, self.n_features, self.n_components, self.n_features)
+        assert mu.size() in [(self.n_components, self.n_features), (1, self.n_components,
+                                                                    self.n_features)], "Input mu does not have required tensor dimensions (%i, %i) or (1, %i, %i)" % (
+        self.n_components, self.n_features, self.n_components, self.n_features)
 
         if mu.size() == (self.n_components, self.n_features):
             self.mu = mu.unsqueeze(0)
         elif mu.size() == (1, self.n_components, self.n_features):
             self.mu.data = mu
-
 
     def __update_var(self, var):
         """
@@ -412,7 +474,10 @@ class GaussianMixture(torch.nn.Module):
             var:        torch.FloatTensor
         """
         if self.covariance_type == "full":
-            assert var.size() in [(self.n_components, self.n_features, self.n_features), (1, self.n_components, self.n_features, self.n_features)], "Input var does not have required tensor dimensions (%i, %i, %i) or (1, %i, %i, %i)" % (self.n_components, self.n_features, self.n_features, self.n_components, self.n_features, self.n_features)
+            assert var.size() in [(self.n_components, self.n_features, self.n_features), (
+            1, self.n_components, self.n_features,
+            self.n_features)], "Input var does not have required tensor dimensions (%i, %i, %i) or (1, %i, %i, %i)" % (
+            self.n_components, self.n_features, self.n_features, self.n_components, self.n_features, self.n_features)
 
             if var.size() == (self.n_components, self.n_features, self.n_features):
                 self.var = var.unsqueeze(0)
@@ -420,13 +485,14 @@ class GaussianMixture(torch.nn.Module):
                 self.var.data = var
 
         elif self.covariance_type == "diag":
-            assert var.size() in [(self.n_components, self.n_features), (1, self.n_components, self.n_features)], "Input var does not have required tensor dimensions (%i, %i) or (1, %i, %i)" % (self.n_components, self.n_features, self.n_components, self.n_features)
+            assert var.size() in [(self.n_components, self.n_features), (1, self.n_components,
+                                                                         self.n_features)], "Input var does not have required tensor dimensions (%i, %i) or (1, %i, %i)" % (
+            self.n_components, self.n_features, self.n_components, self.n_features)
 
             if var.size() == (self.n_components, self.n_features):
                 self.var = var.unsqueeze(0)
             elif var.size() == (1, self.n_components, self.n_features):
                 self.var.data = var
-
 
     def __update_pi(self, pi):
         """
@@ -434,10 +500,11 @@ class GaussianMixture(torch.nn.Module):
         args:
             pi:         torch.FloatTensor
         """
-        assert pi.size() in [(1, self.n_components, 1)], "Input pi does not have required tensor dimensions (%i, %i, %i)" % (1, self.n_components, 1)
+        assert pi.size() in [
+            (1, self.n_components, 1)], "Input pi does not have required tensor dimensions (%i, %i, %i)" % (
+        1, self.n_components, 1)
 
         self.pi.data = pi
-
 
     def get_kmeans_mu(self, x, n_centers, init_times=50, min_delta=1e-3):
         """
@@ -452,7 +519,7 @@ class GaussianMixture(torch.nn.Module):
             x = x.squeeze(1)
         x_min, x_max = x.min(), x.max()
         x = (x - x_min) / (x_max - x_min)
-        
+
         min_cost = np.inf
 
         for i in range(init_times):
@@ -480,4 +547,4 @@ class GaussianMixture(torch.nn.Module):
 
             delta = torch.norm((center_old - center), dim=1).max()
 
-        return (center.unsqueeze(0)*(x_max - x_min) + x_min)
+        return (center.unsqueeze(0) * (x_max - x_min) + x_min)
