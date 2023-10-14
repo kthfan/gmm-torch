@@ -4,10 +4,6 @@
 import torch
 import numpy as np
 
-from math import pi
-from collections import deque
-
-# compatible with torch 1.8
 if hasattr(torch.linalg, 'cholesky_ex'):
     cholesky = lambda *args, **kwargs: torch.linalg.cholesky_ex(*args, **kwargs)[0]
 elif hasattr(torch.linalg, 'cholesky'):
@@ -163,7 +159,7 @@ class GaussianMixture(torch.nn.Module):
 
         if self.init_params == "kmeans" and self.mu_init is None:
             mu = self.get_kmeans_mu(x, n_centers=self.n_components)
-            self.mu.data = mu
+            self.mu.copy_(mu)
 
         i = 0
 
@@ -326,7 +322,7 @@ class GaussianMixture(torch.nn.Module):
             precision = inverse(var)
             d = x.shape[-1]
 
-            log_2pi = d * np.log(2. * pi)
+            log_2pi = d * np.log(2. * np.pi)
 
             log_det = self._calculate_log_det(precision)
 
@@ -506,45 +502,43 @@ class GaussianMixture(torch.nn.Module):
 
         self.pi.data = pi
 
-    def get_kmeans_mu(self, x, n_centers, init_times=50, min_delta=1e-3):
+    def get_kmeans_mu(self, x, n_centers, max_iter=300, min_delta=1e-3):
         """
         Find an initial value for the mean. Requires a threshold min_delta for the k-means algorithm to stop iterating.
-        The algorithm is repeated init_times often, after which the best centerpoint is returned.
+        Using kmeans++ initialization.
         args:
             x:            torch.FloatTensor (n, d) or (n, 1, d)
-            init_times:   init
+            max_iter:     int
             min_delta:    int
         """
-        if len(x.size()) == 3:
-            x = x.squeeze(1)
-        x_min, x_max = x.min(), x.max()
-        x = (x - x_min) / (x_max - x_min)
+        if len(x.size()) == 2:
+            x = x.unsqueeze(1)
+        x_min, x_max = x.min(dim=0, keepdim=True)[0], x.max(dim=0, keepdim=True)[0]
+        x = (x - x_min) / (x_max - x_min + self.eps)
 
-        min_cost = np.inf
+        ##### kmeans_pp_initialization #####
+        n = x.shape[0]
+        centers = torch.zeros((1, n_centers, x.shape[-1]), dtype=x.dtype, device=x.device)
+        centers[:, 0] = x[np.random.randint(n)]
+        for i in range(1, n_centers):
+            distances = torch.sum((centers[:, :i] - x) ** 2, dim=2)
+            d2 = distances.min(dim=1)[0]
+            probs = d2 / d2.sum()
+            j = torch.where(probs.cumsum(0) >= np.random.uniform())[0][0]
+            centers[:, i] = x[j]
 
-        for i in range(init_times):
-            tmp_center = x[np.random.choice(np.arange(x.shape[0]), size=n_centers, replace=False), ...]
-            l2_dis = torch.norm((x.unsqueeze(1).repeat(1, n_centers, 1) - tmp_center), p=2, dim=2)
-            l2_cls = torch.argmin(l2_dis, dim=1)
-
-            cost = 0
-            for c in range(n_centers):
-                cost += torch.norm(x[l2_cls == c] - tmp_center[c], p=2, dim=1).mean()
-
-            if cost < min_cost:
-                min_cost = cost
-                center = tmp_center
-
+        ##### run kmeans #####
         delta = np.inf
-
-        while delta > min_delta:
-            l2_dis = torch.norm((x.unsqueeze(1).repeat(1, n_centers, 1) - center), p=2, dim=2)
+        for i in range(max_iter):
+            l2_dis = torch.norm((x - centers), p=2, dim=2)
             l2_cls = torch.argmin(l2_dis, dim=1)
-            center_old = center.clone()
-
+            centers_old = centers.clone()
+            
             for c in range(n_centers):
-                center[c] = x[l2_cls == c].mean(dim=0)
+                centers[:,c] = x[l2_cls == c].mean(dim=0)
 
-            delta = torch.norm((center_old - center), dim=1).max()
+            delta = torch.norm((centers_old - centers), dim=1).max()
+            if delta <= min_delta:
+                break
 
-        return (center.unsqueeze(0) * (x_max - x_min) + x_min)
+        return (centers * (x_max - x_min) + x_min)
